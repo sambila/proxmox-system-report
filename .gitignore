@@ -1,0 +1,18 @@
+# Report files
+proxmox_report_*.txt
+*.log
+
+# Backup files
+*.bak
+*.tmp
+*~
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Editor directories
+.vscode/
+.idea/
+*.swp
+*.swo
