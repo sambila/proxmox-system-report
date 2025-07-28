@@ -1,6 +1,6 @@
 #!/bin/bash
 # Proxmox System Report Generator - Markdown Edition
-# Version: 2.0.0
+# Version: 2.1.0
 # Author: github.com/sambila
 # License: MIT
 
@@ -40,6 +40,12 @@ create_badge() {
   else
     echo '<span style="color: #f59e0b;">⚡ '"$status"'</span>'
   fi
+}
+
+# Zeitstempel formatieren
+format_date() {
+  local timestamp=$1
+  date -d "@$timestamp" "+%d.%m.%Y %H:%M" 2>/dev/null || echo "$timestamp"
 }
 
 # === Report-Header ===
@@ -174,6 +180,138 @@ if pct list | grep -q "running\|stopped"; then
   done >> "$REPORT_FILE"
   echo "" >> "$REPORT_FILE"
 fi
+
+# === Backup Status ===
+print_header "Backup-Status"
+
+# Backup Jobs
+print_subheader "Geplante Backup-Jobs"
+if [ -f /etc/pve/vzdump.cron ]; then
+  echo "| Zeitplan | Typ | Ziel | VMs/Container |" >> "$REPORT_FILE"
+  echo "|----------|-----|------|---------------|" >> "$REPORT_FILE"
+  
+  while IFS= read -r line; do
+    # Skip comments and empty lines
+    if [[ ! "$line" =~ ^# ]] && [[ -n "$line" ]]; then
+      # Parse cron line
+      schedule=$(echo "$line" | awk '{print $1" "$2" "$3" "$4" "$5}')
+      vzdump_cmd=$(echo "$line" | cut -d' ' -f6-)
+      
+      # Extract storage
+      storage=$(echo "$vzdump_cmd" | grep -oP 'storage=\K[^ ]+' || echo "local")
+      
+      # Extract mode
+      mode="Snapshot"
+      if echo "$vzdump_cmd" | grep -q "mode=stop"; then
+        mode="Stop"
+      elif echo "$vzdump_cmd" | grep -q "mode=suspend"; then
+        mode="Suspend"
+      fi
+      
+      # Extract VMs/CTs
+      vmids=$(echo "$vzdump_cmd" | grep -oE '[0-9]+' | tail -n +2 | tr '\n' ',' | sed 's/,$//')
+      if [ -z "$vmids" ]; then
+        vmids="Alle"
+      fi
+      
+      # Convert schedule to readable format
+      case "$schedule" in
+        "0 2 * * *") readable_schedule="Täglich 02:00" ;;
+        "0 3 * * 0") readable_schedule="Sonntags 03:00" ;;
+        "0 1 * * 1-5") readable_schedule="Mo-Fr 01:00" ;;
+        *) readable_schedule="$schedule" ;;
+      esac
+      
+      echo "| $readable_schedule | $mode | $storage | $vmids |"
+    fi
+  done < /etc/pve/vzdump.cron >> "$REPORT_FILE"
+else
+  echo "Keine geplanten Backup-Jobs konfiguriert." >> "$REPORT_FILE"
+fi
+echo "" >> "$REPORT_FILE"
+
+# Recent Backups
+print_subheader "Letzte Backups"
+{
+  # Find backup files in common locations
+  backup_found=false
+  echo "| VM/CT | Typ | Datum | Größe | Speicherort |" >> "$REPORT_FILE"
+  echo "|-------|-----|-------|-------|-------------|" >> "$REPORT_FILE"
+  
+  # Check all storage locations for backup files
+  for storage in $(pvesm status | awk 'NR>1 && $2 ~ /dir|nfs|cifs/ {print $1}'); do
+    storage_path=$(pvesm path $storage:backup 2>/dev/null | cut -d: -f2 | sed 's|/backup||')
+    if [ -d "$storage_path/dump" ]; then
+      # Find recent backup files (last 10)
+      find "$storage_path/dump" -name "vzdump-*.vma*" -o -name "vzdump-*.tar*" 2>/dev/null | \
+      sort -r | head -10 | while read backup_file; do
+        backup_found=true
+        filename=$(basename "$backup_file")
+        
+        # Parse filename
+        if [[ "$filename" =~ vzdump-(qemu|lxc)-([0-9]+)-([0-9]{4}_[0-9]{2}_[0-9]{2}-[0-9]{2}_[0-9]{2}_[0-9]{2}) ]]; then
+          vm_type="${BASH_REMATCH[1]}"
+          vm_id="${BASH_REMATCH[2]}"
+          backup_date="${BASH_REMATCH[3]}"
+          
+          # Convert type
+          if [ "$vm_type" = "qemu" ]; then
+            vm_type="VM"
+          else
+            vm_type="CT"
+          fi
+          
+          # Get VM/CT name
+          if [ "$vm_type" = "VM" ]; then
+            vm_name=$(qm config "$vm_id" 2>/dev/null | grep "^name:" | cut -d' ' -f2 || echo "ID-$vm_id")
+          else
+            vm_name=$(pct config "$vm_id" 2>/dev/null | grep "^hostname:" | cut -d' ' -f2 || echo "ID-$vm_id")
+          fi
+          
+          # Format date
+          formatted_date=$(echo "$backup_date" | sed 's/_/ /;s/-/:/g;s/ /-/')
+          
+          # Get file size
+          file_size=$(du -h "$backup_file" | cut -f1)
+          
+          echo "| $vm_name | $vm_type | $formatted_date | $file_size | $storage |"
+        fi
+      done
+    fi
+  done
+  
+  if [ "$backup_found" = false ]; then
+    echo "| Keine aktuellen Backups gefunden | - | - | - | - |" >> "$REPORT_FILE"
+  fi
+} >> "$REPORT_FILE"
+echo "" >> "$REPORT_FILE"
+
+# Backup Storage Usage
+print_subheader "Backup-Speicher"
+{
+  echo "| Speicher | Gesamt | Belegt | Frei | Auslastung |" >> "$REPORT_FILE"
+  echo "|----------|--------|--------|------|------------|" >> "$REPORT_FILE"
+  
+  for storage in $(pvesm status | awk 'NR>1 {print $1}'); do
+    # Check if storage is used for backups
+    content=$(pvesm status | grep "^$storage" | awk '{print $3}')
+    if [[ "$content" =~ "backup" ]] || pvesm path $storage:backup >/dev/null 2>&1; then
+      storage_info=$(pvesm status | grep "^$storage")
+      total=$(echo "$storage_info" | awk '{print $4}')
+      used=$(echo "$storage_info" | awk '{print $5}')
+      avail=$(echo "$storage_info" | awk '{print $6}')
+      percent=$(echo "$storage_info" | awk '{print $7}')
+      
+      # Convert to GB
+      total_gb=$(echo "scale=1; $total / 1024 / 1024" | bc)
+      used_gb=$(echo "scale=1; $used / 1024 / 1024" | bc)
+      avail_gb=$(echo "scale=1; $avail / 1024 / 1024" | bc)
+      
+      echo "| $storage | ${total_gb} GB | ${used_gb} GB | ${avail_gb} GB | $percent |"
+    fi
+  done
+} >> "$REPORT_FILE"
+echo "" >> "$REPORT_FILE"
 
 # === Storage ===
 print_header "Speicher"
